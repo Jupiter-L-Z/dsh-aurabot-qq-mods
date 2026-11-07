@@ -97,6 +97,10 @@ return function Panel({ settings, draftSettings, setSettings, save, toast }) {
   }
 
   return h('div', null,
+    h(ui.Card, { title: '自主待办' },
+      h(ui.Switch, { on: cur.autonomousEnabled === true, onChange: v => patch({ autonomousEnabled: !!v }) }),
+      h('p', { className: 'ab-note' }, '开启后，AI 可在各种对话中自主决定后续事项及联系时间，不要求用户指定时间；仍须尊重勿扰意愿和权限。修改、完成或撤回需用户确认。')
+    ),
     greetingSettings('Morning', '早安问候', '每天 0 点生成，8:00–10:00 随机触发'),
     greetingSettings('Evening', '晚安问候', '每天 0 点生成，20:00–22:00 随机触发'),
     h(ui.Card, { title: '正在计时' },

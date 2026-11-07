@@ -17,12 +17,13 @@ import { createTodoBook } from './todo.mjs'
 export default {
   id: 'todo',
   name: '待办调度',
-  version: '1.0.0',
+  version: '1.1.0',
   api: 1,
   description: '到点自动把念头送到指定聊天；支持次数、每天重复',
 
   defaults: {
     crossChatUsers: '',
+    autonomousEnabled: false,
     maxPerScan: 10,
     greetingsEnabled: false,
     greetingsCandidates: '',
@@ -43,7 +44,34 @@ export default {
     // 模块是否运行由模块管理器控制，这里不再提供第二个 enabled 开关。
     const on = () => true
 
+    const pendingChanges = new Map()
     const book = createTodoBook(join(api.dataDir(), 'todo.json'), (m) => api.log.warn(m))
+
+    // Confirmation is received directly from a real user, never from tool arguments.
+    api.on('message', async (msg) => {
+      const text = String(msg.text || '').trim()
+      const match = /^确认 (撤回|修改|完成) ([a-f0-9]+) ([a-f0-9]+)$/.exec(text)
+      if (!match) return false
+      const key = match[2] + ':' + match[3]
+      const request = pendingChanges.get(key)
+      const uid = String(msg.userId || msg.uid || msg.sender?.user_id || '')
+      if (!request || request.chatId !== msg.chatId || !request.senders.includes(uid) || request.action !== match[1]) return false
+      pendingChanges.delete(key)
+      const item = book.all().find(t => t.id === match[2])
+      if (Date.now() > request.expires || !item || item.state !== 'open' || JSON.stringify(item) !== request.snapshot) {
+        await api.send(msg.chatId, '确认已过期或任务发生变化，请重新查看任务并请求修改。')
+        return true
+      }
+      book.clearTimer(item.id)
+      if (request.action === '撤回') book.drop(item.id)
+      else if (request.action === '完成') book.done(item.id)
+      else {
+        book.update(item.id, request.patch)
+        book.scheduleOne(book.all().find(t => t.id === item.id), fire)
+      }
+      await api.send(msg.chatId, '已' + request.action + '待办 ' + item.id + '：' + item.thought)
+      return true
+    })
 
     const ymd = (d = new Date()) => {
       const p = (n) => String(n).padStart(2, '0')
@@ -184,21 +212,31 @@ export default {
           '第二段一定要写原因。次数照对方说的填：说三次就填 3，说每天就填 -1，没说就填 1。' +
           '第六段由你根据对方要求填写重复间隔分钟；没说就省略，默认 1 分钟。时间只写几点几分，不用写日期（默认今天）。',
         properties: {
-          raw: { type: 'string', description: '一整条：来源|念头和原因|目的对话|HH:MM|次数|重复间隔分钟（可省略）' },
+          raw: { type: 'string', description: '来源|念头和原因|目的对话|HH:MM或0|次数|间隔分钟' },
+          date: { type: 'string', description: '指定日期 YYYY-MM-DD，明天必须明确填明天日期' },
+          delayMinutes: { type: 'number', description: '从现在延迟的分钟数，优先于 raw 时间；必须大于0' },
         },
         required: ['raw'],
-        execute: async ({ raw }) => {
+        execute: async ({ raw, date, delayMinutes }) => {
           const parts = String(raw || '').split('|').map((part) => part.trim())
           if (parts.length < 4) return { ok: false, message: '格式是：来源对话|念头|目的对话|时间(HH:MM)|次数' }
           if (!/^(private|group):\d+$/.test(parts[2])) return { ok: false, message: '目的对话须为 private:QQ号 或 group:群号' }
           if (parts[2] !== chatId && !crossAllowed()) return { ok: false, message: '你只能在当前对话创建待办' }
           parts[0] = chatId
           // 每条待办的重复间隔由 raw 第六段决定；省略时由待办本子使用默认值。
-          const r = book.add(parts.join('|'))
+          let input = { from: chatId, thought: parts[1], to: parts[2], time: parts[3], times: parts[4] === undefined ? 1 : Number(parts[4]), gapMs: Number(parts[5]) * 60000, date }
+          if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return { ok: false, message: '日期必须是 YYYY-MM-DD' }
+          if (delayMinutes !== undefined) {
+            if (!Number.isFinite(delayMinutes) || delayMinutes <= 0 || delayMinutes > 525600) return { ok: false, message: '延迟分钟数须大于0且不超过一年' }
+            const when = new Date(Math.ceil((Date.now() + delayMinutes * 60000) / 60000) * 60000)
+            input.date = ymd(when)
+            input.time = String(when.getHours()).padStart(2, '0') + ':' + String(when.getMinutes()).padStart(2, '0')
+          }
+          const r = book.add(input)
           if (r.ok) {
             try { book.scheduleOne(r.item, (f) => { fire(f) }) } catch (error) {}
           }
-          return r.ok ? { ok: true, message: r.message } : r
+          return r.ok ? { ok: true, message: r.message, item: r.item } : r
         },
       }))
 
@@ -206,12 +244,39 @@ export default {
       tools.push({ ...addSpec, name: 'remind_me', description: 'todo_add 的别名，格式完全一样。' })
       tools.push({ ...addSpec, name: 'note_it', description: 'todo_add 的别名，格式完全一样。' })
 
+      const requestChange = (action, id, patch = {}) => {
+        const item = book.all().find(t => t.id === id && t.state === 'open' && canAccess(t))
+        if (!item) return { ok: false, message: '未找到有权操作的待办；先用 todo_list 获取准确 ID' }
+        const senders = api.core.hub.turnSenders?.(sessionId)
+        if (!Array.isArray(senders) || !senders.length) return { ok: false, message: '当前没有可确认的用户，请在用户对话中操作' }
+        const token = Math.random().toString(16).slice(2, 10)
+        const command = `确认 ${action} ${id} ${token}`
+        pendingChanges.set(id + ':' + token, { action, chatId, senders: senders.map(String), snapshot: JSON.stringify(item), patch, expires: Date.now() + 10 * 60000 })
+        return { ok: true, pending: true, item, proposed: patch, message: `尚未${action}。请展示任务 ID、日期时间、目标和内容${action === '修改' ? '以及修改前后差异' : ''}，请用户明确回复「${command}」。10分钟内有效；任务变化后失效。` }
+      }
       tools.push(api.defineTool({
-        name: 'todo_done',
-        description: '把一条待办划掉。match 给念头里的关键词就行。',
-        properties: { match: { type: 'string', description: '关键词，几个字就够' } },
-        required: ['match'],
-        execute: async ({ match }) => book.done(match, canAccess),
+        name: 'todo_done', description: '请求标记完成；必须使用准确 ID，用户确认后才执行。',
+        properties: { id: { type: 'string', description: 'todo_list 返回的唯一 ID' } }, required: ['id'],
+        execute: async ({ id }) => requestChange('完成', id),
+      }))
+      tools.push(api.defineTool({
+        name: 'todo_update', description: '请求修改待办内容或时间，展示修改前后并让用户确认，不会直接修改。',
+        properties: { id: { type: 'string' }, thought: { type: 'string' }, date: { type: 'string', description: 'YYYY-MM-DD' }, time: { type: 'string', description: 'HH:MM' } }, required: ['id'],
+        execute: async ({ id, thought, date, time }) => {
+          const current = book.all().find(t => t.id === id && canAccess(t))
+          if (!current) return { ok: false, message: '找不到任务' }
+          const patch = {}
+          if (thought !== undefined) { if (!thought.trim()) return { ok: false, message: '内容不能为空' }; patch.thought = thought.trim().slice(0,200) }
+          if (date !== undefined || time !== undefined) {
+            const d = date ?? current.date, h = time ?? current.hhmm
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(h)) return { ok: false, message: '日期时间格式错误' }
+            const at = new Date(d + 'T' + h + ':00').getTime()
+            if (!Number.isFinite(at) || at <= Date.now()) return { ok: false, message: '修改后的时间必须在未来' }
+            Object.assign(patch, { date: d, hhmm: h, at })
+          }
+          if (!Object.keys(patch).length) return { ok: false, message: '没有提出修改' }
+          return requestChange('修改', id, patch)
+        },
       }))
 
       tools.push(api.defineTool({
@@ -219,27 +284,20 @@ export default {
         description: '看看手上还有哪些待办没触发完。',
         properties: {},
         execute: async () => {
-          const list = book.openItems().filter(canAccess)
+          const list = book.all().filter(t => t.state === 'open' && canAccess(t))
           if (!list.length) return { ok: true, message: '手上没有待办' }
           return {
             ok: true,
-            message: list.map((t) => `${t.at ? t.hhmm : '待处理（无定时）'} → ${t.to}：${t.thought}${t.at ? `（${t.times === -1 ? '每天' : '还有 ' + t.times + ' 次'}）` : ''}`).join('\n'),
+            items: list,
+            message: list.map((t) => `[${t.id}] ${t.date} ${t.at ? t.hhmm : '待处理（无定时）'} → ${t.to}：${t.thought}${t.at ? `（${t.times === -1 ? '每天' : '还有 ' + t.times + ' 次'}）` : ''}`).join('\n'),
           }
         },
       }))
 
       tools.push(api.defineTool({
-        name: 'todo_cancel',
-        description: '把一条待办撤回（取消掉，以后不会再触发）。match 给念头里的关键词就行。',
-        properties: { match: { type: 'string', description: '关键词，几个字就够' } },
-        required: ['match'],
-        execute: async ({ match }) => {
-          const r = book.drop(match, canAccess)
-          if (r.ok) {
-            try { book.clearTimer(r.item.id) } catch (error) {}
-          }
-          return r.ok ? { ok: true, message: '撤回了：' + r.item.thought } : r
-        },
+        name: 'todo_cancel', description: '请求撤回指定待办。先列出任务，准确 ID 定位并向用户确认；不会直接撤回。',
+        properties: { id: { type: 'string', description: '唯一任务 ID，不接受模糊关键词' } }, required: ['id'],
+        execute: async ({ id }) => requestChange('撤回', id),
       }))
 
       return tools
@@ -254,16 +312,17 @@ export default {
         : '私聊可以把当前私聊作为来源和目的对话；如果工具调用失败，要如实说没记进去。'
       return [
         '（你有个小本子，工具叫 todo_add，一直都在。',
+        settings().autonomousEnabled === true ? '【自主待办已开启】你可以在对话的任何方面自主决定是否需要后续行动，自行选择合理时间，无须用户明确指定情景或时刻。包括稍后回来、明天找人、等对方忙完、分享兴奋心情等，但不限于这些例子。使用 date 指定日期，或 delayMinutes 设置延迟；不要把明天写成今天。不要用时间0反复自我唤醒；通常先安排一次，再根据真实互动决定后续。尊重别打扰、拒绝联系及休息意愿，不要密集骚扰或绕过权限。' : '【自主待办已关闭】不要仅凭自己的想法主动安排联系；明确承诺仍须写待办。',
         '只要你做出明确承诺，或者事情会跨过当前这一轮、需要稍后/下一轮/明天/之后继续处理，就必须立刻写 todo，不能只说「我记着了」。',
         '明确承诺包括「我会……」「我去……」「回来……」「到时候……」「明天……」「晚点……」「之后……」「再提醒……」，以及答应替别人完成、发送、询问、提醒或跟进的事情。',
-        '没有明确时间但超出当前一轮或涉及跨聊天的隐性任务也可以写入 todo，例如答应去另一个聊天找人、询问并带回结果；第四段填 0 表示立即安排执行，不要编造时间。跨聊天仍须遵守工具权限；排队不等于完成，不要声称已完成或已收到结果。',
+        '没有明确时间但超出当前一轮或涉及跨聊天的隐性任务也可以写入 todo，例如答应去另一个聊天找人、询问并带回结果；自主模式关闭时第四段填 0 表示立即安排执行；自主模式开启时可以自己选择合理的未来时间。跨聊天仍须遵守工具权限；排队不等于完成，不要声称已完成或已收到结果。',
         groupRule,
         '格式一条一行，竖线分开六段（第六段可省略）：来源对话|念头和原因|目的对话|时间(HH:MM)|次数。',
         '例：private:123456|想问问他作业写完没，怕他熬夜|private:123456|14:30|3',
         '【第二段一定要写原因】别只写「回来找他」，要写为什么。',
         '【时间和次数照着对方说的填】对方说「每分钟一次，一共三次」，次数就填 3。',
         `到点后每隔 第六段指定的分钟再来一次，直到次数用完。没写次数就是 1 次，写 -1 是每天。`,
-        '做完了用 todo_done，match 给个关键词就行。不想做了就用 todo_cancel 撤回。别假装已经记下。）',
+        '修改、完成或撤销先用 todo_list 查唯一 ID，再调用 todo_update/todo_done/todo_cancel；展示具体任务和修改差异，请用户回复工具给出的确认口令，不得代替用户确认或声称已执行。别假装已经记下。）',
       ]
     })
 
